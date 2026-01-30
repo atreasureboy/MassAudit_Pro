@@ -1,0 +1,6 @@
+openai>=1.0.0
+tenacity
+rich
+python-dotenv
+# 如果需要，可以添加其他标准库中没有包含的依赖
+# 例如，如果CodeQL CLI需要特定的Python包来集成，可以在这里添加。
