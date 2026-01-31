@@ -3,46 +3,38 @@
 > **Automated Static Analysis & AI-Assisted Verification Tool**
 > **基于 CodeQL 与大模型的自动化静态代码审计与验证系统**
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue) ![CodeQL](https://img.shields.io/badge/Engine-CodeQL-green) ![DeepSeek](https://img.shields.io/badge/AI-DeepSeek%20%2F%20Local-purple) ![License](https://img.shields.io/badge/License-MIT-grey)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![CodeQL](https://img.shields.io/badge/Engine-CodeQL-green) ![DeepSeek](https://img.shields.io/badge/AI-DeepSeek%20%2F%20LLM-purple) ![License](https://img.shields.io/badge/License-MIT-grey)
 
-**MassAudit Pro** 是一款面向企业安全建设与 DevSecOps 流程的自动化代码审计工具。它致力于解决传统静态应用程序安全测试 (SAST) 工具误报率高、验证成本大的问题。
+**MassAudit Pro** 是一款面向企业安全建设与 DevSecOps 流程的下一代自动化代码审计工具。它致力于解决传统静态应用程序安全测试 (SAST) 工具误报率高、验证成本大、上下文缺失的问题。
 
-系统深度整合了 **CodeQL** 的污点追踪能力与 **LLM (大语言模型)** 的逻辑分析能力，不仅能发现深层逻辑漏洞，还能尝试生成**单元测试级别的验证脚本 (PoC Drafts)**，辅助安全工程师快速验证风险。
+系统深度整合了 **CodeQL** 的精准代码检索能力与 **DeepSeek LLM** 的深度逻辑分析能力，不仅能发现深层逻辑漏洞，还能**自动编写、修复并执行单元测试级别的验证脚本 (PoC)**，最终通过 **AI 裁判** 对验证日志进行智能定性，实现从发现到验证的全闭环。
 
 ---
 
-## 🌟 核心功能 (Core Features)
+## 🌟 核心特性 (Key Features)
 
-### 🧠 1. 智能上下文感知 (Context-Aware Analysis)
-* **消除幻觉**：当静态分析发现潜在风险但缺乏上下文（如未定义的函数调用）时，系统会自动在项目源码中递归检索相关定义（包括 Go/Python 的函数、变量、常量）。
-* **精准研判**：将完整的代码上下文投喂给 AI，大幅降低因“看不见过滤逻辑”导致的误报。
+### 1. 🧠 智能上下文循环 (Agentic Context Loop)
+* **消除幻觉**：当 AI 认为代码片段不足以判断风险时（例如看到未定义的函数调用），会主动要求系统在源码中检索该函数的完整定义。
+* **精准研判**：系统会自动递归提取相关变量、结构体和函数定义，大幅降低因“看不见过滤逻辑”导致的误报。
 
-### ⚡ 2. 自动化验证辅助 (Auto-Verification Support)
+### 2. ⚡ 自动化验证与自愈 (Auto-Verification & Self-Healing)
 * **PoC 草稿生成**：针对逻辑型漏洞（如边界溢出、Panic、正则绕过），系统会尝试编写 Go/Python 单元测试脚本。
-* **独立归档**：生成的验证脚本会自动归档至 `poc_scripts/` 目录，与源代码隔离，便于后续审计复查。
+* **代码自愈**：如果生成的测试脚本因缺包、语法错误导致编译失败，**自愈模块**会将报错信息回传给 AI，自动修正代码并重试（支持多轮自动修复）。
 
-### 🚀 3. 企业级批量处理 (Batch Processing)
-* **断点续传 (Resume Mode)**：自动跳过已审计项目，支持随时中断任务。
-* **全量回溯 (Rescan Mode)**：支持强制重新扫描，自动按时间戳归档历史报告。
-* **资源优化**：自动管理 CodeQL 数据库生命周期，分析即焚，节省存储空间。
-
-### 🎯 4. 结构化报告 (Structured Reporting)
-* **Markdown 报告**：包含漏洞详情、风险等级、代码片段、修复建议及验证指引。
-* **本地数据归档**：审计结果自动存入本地 SQLite 数据库，便于长期趋势分析。
+### 3. ⚖️ AI 智能裁判 (AI Judge)
+* **智能定性**：AI 会阅读测试日志，区分“程序崩溃”、“被捕获的异常”和“安全防御”。
+* **去伪存真**：如果测试脚本运行通过且未触发异常，AI 会将其标记为 **SAFE_PASS**（已防御），有效过滤误报。
 
 ---
 
-## ⚠️ 关于自动化 PoC 的重要说明 (Important Note on Auto-PoC)
+## ⚠️ 重要说明 (Important Note)
 
-**AI 生成的验证脚本（PoC）主要作为“逻辑草稿”，通常需要人工微调才能运行。**
+**无法单元测试的漏洞，需手动完成测试。**
 
-由于 Go 等静态语言编译器极其严格，自动生成的代码可能存在以下常见问题：
-1.  **依赖缺失**：引入了包但未配置 `go.mod`，或引入了未使用包导致编译错误。
-2.  **上下文缺失**：Mock 对象时可能缺少部分结构体字段的初始化。
-3.  **运行方式**：建议在目标源码目录下使用 `go test -v .` 运行，以便加载同包下的其他文件（如结构体定义），单文件运行可能会报 `undefined` 错误。
+AI 虽然强大，但并非万能。对于依赖复杂外部环境（如数据库特定状态、中间件配置、第三方 API）的漏洞，自动化脚本可能无法完美复现。
 
 **建议流程**：
-> 生成脚本 -> 复制到源码目录 -> **人工修正 (Fix Imports/Structs)** -> 运行验证
+> `python3 main.py` -> 查看生成的 `.md` 报告 -> 针对未验证项进行手动复现
 
 ---
 
@@ -56,15 +48,19 @@
     * **Context Resolver** 动态补全缺失的函数/变量定义。
     * AI 判定风险等级。
     * **Code Generator** 尝试编写验证脚本 (PoC)。
-5.  **[归档输出]** 生成 Markdown 报告，保存 PoC 文件，写入数据库。
+5.  **[验证与归档]**
+    * 执行 PoC 脚本（含编译错误自愈）。
+    * **AI Judge** 分析控制台输出，判定验证结果（崩溃/通过/异常）。
+    * 生成 Markdown 报告，保存 PoC 文件，写入数据库。
 
 ---
 
 ## 🛠️ 快速开始 (Quick Start)
 
 ### 1. 环境准备
-* Python 3.8+
+* Python 3.10+
 * **CodeQL CLI** (需配置到系统 PATH)
+* **Golang** (用于运行验证脚本)
 * 目标语言的 CodeQL 规则包 (Standard Libraries)
 
 ### 2. 安装
@@ -72,38 +68,41 @@
 git clone [https://github.com/YourUsername/MassAudit_Pro.git](https://github.com/YourUsername/MassAudit_Pro.git)
 cd MassAudit_Pro
 pip install -r requirements.txt
-3. 配置 (MassAudit_Pro/config.py)
+3. 配置
+编辑 MassAudit_Pro/config.py：
+
 Python
 
 API_KEY = "sk-xxxxxxxxxxxxxxxx"
+API_BASE = "[https://api.deepseek.com/v1](https://api.deepseek.com/v1)"
 PROJECTS_ROOT = r"/path/to/source_code"    # 待审计代码目录
+DB_STORAGE = r"/path/to/codeql_dbs"        # 数据库临时目录
 4. 运行
 Bash
 
 python main.py
 程序将交互式询问运行模式：
 
-[1] 重新扫描: 覆盖式审计，保留历史记录。
+[1] 重新扫描: 覆盖式审计，生成带时间戳的新报告。
 
 [2] 断点续传: 仅扫描新项目（推荐）。
 
-📂 结果验证示例
-报告中将包含如下验证指引：
+📊 结果验证示例
+报告中将包含详细的自动化验证结果，例如：
 
-💣 自动化 PoC 已生成 脚本位置: /abs/path/to/poc_scripts/project_date/test.go 如何验证:
+🛡️ 自动化验证报告 (Auto-Verify)
 
-将脚本复制到漏洞所在目录。
+脚本位置: /abs/path/to/poc_scripts/project_date/test.go
 
-检查并修复脚本中的 import 错误。
+验证状态: ✅ SAFE_PASS
 
-执行命令：
+AI 判定: 测试输出显示 PASS，且未检测到 Panic 日志，代码成功拦截了越界尝试。
 
-Bash
-
-go test -v .
 ⚖️ 免责声明 (Disclaimer)
 本工具旨在辅助安全工程师发现代码缺陷，提升软件质量。
 
 生成的验证脚本仅用于在授权环境（如本地测试环境、CI/CD 流水线）中验证漏洞有效性。
 
-严禁将本工具用于未授权的攻击行为。
+严禁将本工具用于未授权的测试或攻击行为。
+
+开发者不对因使用本工具造成的任何直接或间接损失负责。使用本工具即代表您同意遵守当地法律法规。
