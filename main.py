@@ -86,9 +86,7 @@ class AuditSystem:
 
     def _save_project_report(self, project_name, vulnerabilities):
         """
-        根据模式生成报告文件名：
-        - 模式1 (Rescan): projectname_20230101_120000.md (保留历史)
-        - 模式2 (Resume): projectname_report.md (标准覆盖)
+        根据模式生成报告文件名，并包含PoC信息。
         """
         if self.rescan_mode:
             # 生成带时间戳的文件名
@@ -112,6 +110,16 @@ class AuditSystem:
                     f.write(f"- **文件**: `{v.get('file_path')}` : `{v.get('line_number')}`\n")
                     f.write(f"- **AI 裁决**: **{v.get('verdict')}**\n")
                     f.write(f"- **分析结论**: {v.get('reason')}\n")
+                    
+                    # === [新增] PoC 信息展示 ===
+                    if v.get('has_poc'):
+                        f.write(f"\n> 💣 **自动化 PoC 已生成**\n")
+                        f.write(f"> **脚本位置**: `{v.get('poc_path')}`\n")
+                        f.write(f"> **如何验证**: 请执行以下命令（将脚本注入源码目录运行）：\n")
+                        f.write(f"```bash\n{v.get('poc_cmd')}\n```\n")
+                    elif v.get('verdict', '').upper() in ['HIGH', 'MEDIUM']:
+                         f.write(f"\n> ⚠️ **PoC 未生成**: AI 判断无法进行单元测试或无需测试。\n")
+                         
                     f.write("---\n")
             self.reporter.log_info(f"✅ Report saved: {filename}")
         except Exception as e:
@@ -124,12 +132,9 @@ class AuditSystem:
         if os.path.exists(std_report) and os.path.getsize(std_report) > 50:
             return True
         
-        # 2. 检查是否有带时间戳的历史报告 (例如 project_name_2026...)
-        # 这能防止在切换模式时重复扫描已经扫过的项目
+        # 2. 检查是否有带时间戳的历史报告
         for f in os.listdir(self.reports_dir):
             if f.startswith(f"{project_name}_") and f.endswith(".md"):
-                # 确保是这个项目的文件（防止前缀匹配错误，如 test 和 test_v2）
-                # 简单判断：文件名以 project_name 开头且后面跟 _report 或 _数字
                 return True
         
         return False
@@ -151,19 +156,18 @@ class AuditSystem:
         for i, project_name in enumerate(available_projects):
             project_relative_path = project_name 
             
-            # --- [核心逻辑] 根据模式决定是否跳过 ---
+            # --- 根据模式决定是否跳过 ---
             if not self.rescan_mode:
-                # 模式2：断点续传 -> 如果扫过，就跳过
                 if self._check_if_project_scanned(project_name):
                     self.reporter.log_info(f"⏩ [Skip] {project_name} ({i+1}/{len(available_projects)}): Report exists.")
                     continue
-            else:
-                # 模式1：重新扫描 -> 不跳过，但文件名会变
-                pass
 
             self.reporter.log_info(f"\n🚀 [{i+1}/{len(available_projects)}] Auditing: {project_name}")
 
-            # (以下是标准的扫描流程，未变动)
+            # === [新增] 准备 PoC 存放目录 ===
+            current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            poc_base_dir = os.path.join(os.getcwd(), "poc_scripts", f"{project_name}_{current_time_str}")
+
             if APICaller._circuit_breaker_tripped:
                 break
 
@@ -249,6 +253,47 @@ class AuditSystem:
                     
                     analysis_result['original_rule_id'] = rule_id
                     analysis_result['code_snippet'] = code_snippet
+                    analysis_result['file_uri'] = file_uri # 确保有这个字段
+
+                    # === [新增] 处理 PoC 脚本生成 ===
+                    poc_code = analysis_result.get('poc_code', '')
+                    is_testable = analysis_result.get('is_testable', False)
+                    verdict = analysis_result.get('verdict', '').upper()
+                    
+                    analysis_result['has_poc'] = False # 默认无
+
+                    # 只有 High/Medium 且 AI 说可测且有代码，才保存
+                    if (verdict in ['HIGH', 'MEDIUM']) and is_testable and poc_code and len(poc_code) > 20:
+                        try:
+                            if not os.path.exists(poc_base_dir):
+                                os.makedirs(poc_base_dir)
+
+                            # 生成文件名: rule_id_行号_test.go
+                            safe_rule_id = str(rule_id).replace("/", "_").replace("-", "_")
+                            poc_filename = f"{safe_rule_id}_L{start_line}_test.go"
+                            poc_save_path = os.path.join(poc_base_dir, poc_filename)
+                            
+                            # 写入文件
+                            with open(poc_save_path, "w", encoding="utf-8") as f:
+                                clean_code = poc_code.replace("```go", "").replace("```", "").strip()
+                                f.write(clean_code)
+                            
+                            self.reporter.log_info(f"💣 PoC Saved: {poc_save_path}")
+                            
+                            # 生成运行指令 (Linux/Mac)
+                            target_source_dir = os.path.dirname(os.path.join(full_project_source_path, file_uri))
+                            run_cmd = (
+                                f"cp \"{poc_save_path}\" \"{target_source_dir}/\" && "
+                                f"cd \"{target_source_dir}\" && "
+                                f"go test -v {poc_filename}"
+                            )
+                            
+                            analysis_result['has_poc'] = True
+                            analysis_result['poc_path'] = poc_save_path
+                            analysis_result['poc_cmd'] = run_cmd
+                        except Exception as e:
+                            self.reporter.log_error(f"Failed to save PoC: {e}")
+
                     project_vulnerabilities.append(analysis_result)
                     
                     self._save_to_sqlite(project_name, analysis_result)
@@ -257,7 +302,7 @@ class AuditSystem:
                 except Exception as e:
                     self.reporter.log_error(f"Analysis error: {e}")
 
-            # 保存报告 (文件名根据模式自动决定)
+            # 保存报告
             self._save_project_report(project_name, project_vulnerabilities)
 
             self.codeql_manager.cleanup_database(db_path)
