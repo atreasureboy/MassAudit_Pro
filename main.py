@@ -3,8 +3,8 @@ import logging
 import sqlite3
 import json
 import time
-import subprocess # [新增] 用于执行 shell 命令
-import random     # [新增] 用于生成随机文件名
+import subprocess # Used for executing shell commands
+import random     # Used for generating random filenames
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -19,11 +19,11 @@ from MassAudit_Pro.reporting.reporter import Reporter
 
 class AuditSystem:
     """
-    MassAudit Pro 智能交互式代码审计系统的主协调器。
+    MassAudit Pro: Intelligent Interactive Code Audit System Main Coordinator.
     """
     def __init__(self, rescan_mode: bool = False):
         """
-        初始化审计系统。
+        Initialize the audit system.
         """
         self.rescan_mode = rescan_mode
         self.reporter = Reporter()
@@ -42,7 +42,7 @@ class AuditSystem:
         logging.info(f"AuditSystem initialized. Mode: {mode_str}")
 
     def _init_c2_database(self):
-        """初始化用于 C2 利用的本地数据库"""
+        """Initialize local database for C2 utilization."""
         try:
             conn = sqlite3.connect('my_arsenal.db')
             c = conn.cursor()
@@ -63,7 +63,7 @@ class AuditSystem:
             logging.error(f"Failed to init C2 database: {e}")
 
     def _save_to_sqlite(self, project_name, vuln_data):
-        """将高危漏洞存入 SQLite"""
+        """Save high-risk vulnerabilities to SQLite."""
         if vuln_data.get('verdict', '').upper() not in ['HIGH', 'MEDIUM']:
             return 
             
@@ -81,13 +81,13 @@ class AuditSystem:
                        vuln_data.get('verify_output', 'Not Verified'))) 
             conn.commit()
             conn.close()
-            print(f"💾 [C2] 漏洞已入库: {vuln_data.get('original_rule_id')}")
+            print(f"💾 [C2] Vulnerability stored: {vuln_data.get('original_rule_id')}")
         except Exception as e:
             logging.error(f"DB Error: {e}")
 
     def _save_project_report(self, project_name, vulnerabilities):
         """
-        生成包含验证结果的报告。
+        Generate report containing verification results.
         """
         if self.rescan_mode:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -99,48 +99,42 @@ class AuditSystem:
         
         try:
             with open(report_path, "w", encoding="utf-8") as f:
-                f.write(f"# {project_name} 审计报告\n")
-                f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"**模式**: {'重新扫描 (Rescan)' if self.rescan_mode else '断点续传 (Resume)'}\n")
-                f.write(f"**发现漏洞数**: {len(vulnerabilities)}\n\n")
+                f.write(f"# {project_name} Audit Report\n")
+                f.write(f"**Generated At**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"**Mode**: {'Rescan' if self.rescan_mode else 'Resume'}\n")
+                f.write(f"**Vulnerabilities Found**: {len(vulnerabilities)}\n\n")
                 
                 for idx, v in enumerate(vulnerabilities):
                     f.write(f"## {idx+1}. {v.get('original_rule_id', 'Unknown Issue')}\n")
-                    f.write(f"- **文件**: `{v.get('file_path')}` : `{v.get('line_number')}`\n")
-                    f.write(f"- **AI 裁决**: **{v.get('verdict')}**\n")
-                    f.write(f"- **分析结论**: {v.get('reason')}\n")
+                    f.write(f"- **File**: `{v.get('file_path')}` : `{v.get('line_number')}`\n")
+                    f.write(f"- **AI Verdict**: **{v.get('verdict')}**\n")
+                    f.write(f"- **Analysis**: {v.get('reason')}\n")
                     
-                    # === [修改] 自动化验证结果展示 (更详细的状态) ===
+                    # === [Modified] Automated Verification Results (AI Judge Based) ===
                     if v.get('has_poc'):
-                        f.write(f"\n> 🛡️ **自动化验证报告 (Auto-Verify)**\n")
-                        f.write(f"> **PoC 脚本**: `{v.get('poc_path')}`\n")
+                        f.write(f"\n> 🛡️ **Automated Verification Report (Auto-Verify)**\n")
+                        f.write(f"> **PoC Script**: `{v.get('poc_path')}`\n")
                         
                         verify_status = v.get('verify_status', 'UNKNOWN')
                         verify_output = v.get('verify_output', '').strip()
+                        ai_judge_reason = v.get('ai_judge_reason', 'No reasoning provided.')
                         
-                        if verify_status == "EXECUTION_PASS":
-                            f.write(f"> **验证状态**: ✅ 测试通过 (PASS) - 脚本运行成功且未崩溃\n")
-                            f.write(f"> **说明**: 漏洞可能已被防御，或 PoC 仅验证了连通性。\n")
-                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
+                        # Icon mapping based on AI verdict
+                        icon_map = {
+                            "VULN_CRASH": "🚨", 
+                            "VULN_RECOVERED": "⚠️", 
+                            "SAFE_PASS": "✅", 
+                            "TEST_FAIL": "➖", 
+                            "ERROR": "❌"
+                        }
+                        icon = icon_map.get(verify_status, "❓")
                         
-                        elif verify_status == "EXECUTION_PANIC":
-                            f.write(f"> **验证状态**: 🚨 触发 PANIC (漏洞实锤) - 目标代码崩溃\n")
-                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
-
-                        elif verify_status == "EXECUTION_FAIL":
-                            f.write(f"> **验证状态**: ⚠️ 测试失败 (FAIL) - 脚本运行了但断言未通过\n")
-                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
-
-                        elif verify_status == "COMPILATION_FAILED":
-                            f.write(f"> **验证状态**: ❌ 编译/环境失败 (AI 尝试修复 {v.get('fix_attempts', 0)} 次后仍失败)\n")
-                            f.write(f"> **原因**: 可能是缺包、语法错误或环境缺失\n")
-                            f.write(f"> **错误日志**: \n```text\n{verify_output}\n```\n")
-                        else:
-                            f.write(f"> **验证状态**: ❓ 未知状态 / 运行时异常\n")
-                            f.write(f"> **输出**: \n```text\n{verify_output}\n```\n")
+                        f.write(f"> **Status**: {icon} **{verify_status}**\n")
+                        f.write(f"> **AI Judgment**: {ai_judge_reason}\n")
+                        f.write(f"> **Console Output Snippet**: \n```text\n{verify_output[:1000]}...\n```\n")
                     
                     elif v.get('verdict', '').upper() in ['HIGH', 'MEDIUM']:
-                         f.write(f"\n> ⚠️ **验证**: AI 判断无法进行单元测试或无需测试。\n")
+                         f.write(f"\n> ⚠️ **Verification**: AI determined untestable or skipped.\n")
                          
                     f.write("---\n")
             self.reporter.log_info(f"✅ Report saved: {filename}")
@@ -148,7 +142,7 @@ class AuditSystem:
             self.reporter.log_error(f"Failed to save report for {project_name}: {e}")
 
     def _check_if_project_scanned(self, project_name):
-        """检查该项目是否已经存在任何审计报告"""
+        """Check if report exists."""
         std_report = os.path.join(self.reports_dir, f"{project_name}_report.md")
         if os.path.exists(std_report) and os.path.getsize(std_report) > 50:
             return True
@@ -157,8 +151,57 @@ class AuditSystem:
                 return True
         return False
 
+    def _analyze_poc_output_with_ai(self, console_output: str) -> Dict[str, str]:
+        """
+        [New] AI Judge: Analyze PoC console output to determine if vulnerability is confirmed.
+        """
+        # [关键修改] 使用字符串拼接来构建 Prompt，防止被输出过滤器截断
+        p_role = "You are a Security Audit Result Analyst.\n"
+        p_task = "I ran a Go language PoC (Proof of Concept exploit), and below is the console output.\nPlease analyze this output and determine the vulnerability status.\n"
+        p_content = f"\n【Console Output】\n```text\n{console_output[-2000:]} \n```\n(Showing last 2000 characters)\n"
+        
+        p_criteria = """
+        【Judgment Criteria】
+        1. **VULN_CRASH**: A `panic:` occurred and the process crashed (not caught by recover), or a `segmentation fault` occurred. This is High Risk.
+        2. **VULN_RECOVERED**: A panic occurred but was caught by `recover()` (script often logs "Panic captured" or similar). This indicates Robustness Issue or DoS risk.
+        3. **SAFE_PASS**: Test output `PASS`, and no panic or error messages appeared. Code successfully defended.
+        4. **TEST_FAIL**: Test output `FAIL` (assertion error), but no panic. PoC logic failed to trigger expected behavior.
+        5. **ERROR**: Compilation failed, missing packages, or setup failed. Script didn't run properly.
+        """
+        p_format = """
+        【Output Format】
+        You must return a valid JSON object:
+        {
+            "status": "VULN_CRASH" | "VULN_RECOVERED" | "SAFE_PASS" | "TEST_FAIL" | "ERROR",
+            "reason": "One sentence explaining why."
+        }
+        """
+        # 拼接 Prompt
+        final_prompt = p_role + p_task + p_content + p_criteria + p_format
+        
+        messages = [{"role": "user", "content": final_prompt}]
+        try:
+            # Reuse api_caller
+            response = self.api_caller.call_llm(messages=messages)
+            
+            # Robust JSON parsing
+            try:
+                return json.loads(response)
+            except:
+                # If raw text contains JSON code block, try to extract it
+                if "```json" in response:
+                    clean = response.split("```json")[1].split("```")[0].strip()
+                    return json.loads(clean)
+                elif "{" in response:
+                    return json.loads(response[response.find("{"):response.rfind("}")+1])
+                return {"status": "UNKNOWN", "reason": "Failed to parse AI JSON response."}
+                
+        except Exception as e:
+            logging.error(f"AI Judge Error: {e}")
+            return {"status": "UNKNOWN", "reason": f"AI analysis failed: {e}"}
+
     def run_audit(self):
-        """执行审计流程"""
+        """Execute audit flow."""
         available_projects = []
         if os.path.isdir(PROJECTS_ROOT):
             for item in os.listdir(PROJECTS_ROOT):
@@ -264,7 +307,7 @@ class AuditSystem:
                     analysis_result['code_snippet'] = code_snippet
                     analysis_result['file_uri'] = file_uri
 
-                    # === [核心逻辑] 自愈与自动化验证 ===
+                    # === [Core Logic] Self-Healing & AI-Judged Verification ===
                     poc_code = analysis_result.get('poc_code', '')
                     is_testable = analysis_result.get('is_testable', False)
                     verdict = analysis_result.get('verdict', '').upper()
@@ -272,6 +315,7 @@ class AuditSystem:
                     analysis_result['has_poc'] = False
                     analysis_result['verify_status'] = 'SKIPPED'
                     analysis_result['verify_output'] = ''
+                    analysis_result['ai_judge_reason'] = '' 
                     analysis_result['fix_attempts'] = 0
 
                     if (verdict in ['HIGH', 'MEDIUM']) and is_testable and poc_code and len(poc_code) > 20:
@@ -290,7 +334,7 @@ class AuditSystem:
                             
                             target_source_dir = os.path.dirname(os.path.join(full_project_source_path, file_uri))
                             
-                            MAX_FIX_ATTEMPTS = 5
+                            MAX_FIX_ATTEMPTS = 8
                             current_attempt_code = clean_code
                             
                             for attempt in range(MAX_FIX_ATTEMPTS + 1):
@@ -305,29 +349,22 @@ class AuditSystem:
                                     process = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=15)
                                     output = process.stdout + "\n" + process.stderr
                                     
-                                    # === [修改] 更严格的错误判定逻辑 ===
+                                    # 1. Quick check for obvious environmental errors (compile/missing package)
+                                    # We handle these with the "Self-Healing" loop before asking the AI Judge.
                                     compile_errors = [
-                                        "build failed", 
-                                        "undefined:", 
-                                        "imported and not used",
-                                        "no required module",  # [新增] 缺包
-                                        "cannot find package", # [新增] 找不到包
-                                        "setup failed"         # [新增] 测试启动失败
+                                        "build failed", "undefined:", "imported and not used",
+                                        "no required module", "cannot find package", "setup failed"
                                     ]
-                                    
                                     is_compile_error = any(e in output for e in compile_errors)
 
                                     if is_compile_error:
-                                        # === 编译或环境错误，需要修复 ===
+                                        # === Compilation/Env Error: Auto-Fix ===
                                         if attempt < MAX_FIX_ATTEMPTS:
                                             self.reporter.log_warning(f"❌ Build/Env Failed. Asking AI to fix (Attempt {attempt+1})...")
-                                            
                                             fixed_code = self.vulnerability_analyzer.fix_poc_code(current_attempt_code, output)
                                             current_attempt_code = fixed_code
-                                            
                                             with open(poc_save_path, "w", encoding="utf-8") as f:
                                                 f.write(fixed_code)
-                                            
                                             analysis_result['fix_attempts'] = attempt + 1
                                             continue 
                                         else:
@@ -335,19 +372,17 @@ class AuditSystem:
                                             analysis_result['verify_output'] = output
                                             analysis_result['fix_attempts'] = attempt
                                     else:
-                                        # === 脚本能跑起来了 ===
-                                        self.reporter.log_info(f"✅ Execution Finished!")
+                                        # === Script ran! Send output to AI Judge for verdict ===
+                                        self.reporter.log_info(f"✅ Execution Finished! Asking AI Judge...")
                                         
-                                        if "PASS" in output:
-                                            analysis_result['verify_status'] = "EXECUTION_PASS"
-                                        elif "panic:" in output:
-                                            analysis_result['verify_status'] = "EXECUTION_PANIC"
-                                        elif "FAIL" in output:
-                                            analysis_result['verify_status'] = "EXECUTION_FAIL"
-                                        else:
-                                            analysis_result['verify_status'] = "EXECUTION_UNKNOWN"
-
+                                        # Call AI Judge
+                                        judge_result = self._analyze_poc_output_with_ai(output)
+                                        
+                                        analysis_result['verify_status'] = judge_result.get("status", "UNKNOWN")
+                                        analysis_result['ai_judge_reason'] = judge_result.get("reason", "No reason provided")
                                         analysis_result['verify_output'] = output
+                                        
+                                        self.reporter.log_info(f"⚖️ AI Verdict: {analysis_result['verify_status']} ({analysis_result['ai_judge_reason']})")
                                         break 
 
                                 except subprocess.TimeoutExpired:
@@ -379,22 +414,19 @@ class AuditSystem:
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("   🛡️  MassAudit Pro - 交互式启动")
+    print("   🛡️  MassAudit Pro - Interactive Start")
     print("="*50)
-    print("请选择扫描模式：")
-    print(" [1] 重新扫描 (Rescan)")
-    print("     - 即使项目已有报告，也会重新扫描")
-    print("     - 生成带时间戳的新文件 (如: project_20260130.md)")
-    print("     - ⚠️ 原 md 文件保留，不会被覆盖")
+    print("Select Scan Mode:")
+    print(" [1] Rescan")
+    print("     - Re-scans even if reports exist.")
+    print("     - Creates new files with timestamps.")
     print("")
-    print(" [2] 断点续传 (Resume) [推荐]")
-    print("     - 跳过所有已存在报告的项目")
-    print("     - 仅扫描最新的、未处理的项目")
-    print("     - 生成标准文件名 (project_report.md)")
+    print(" [2] Resume [Recommended]")
+    print("     - Skips already scanned projects.")
     print("="*50)
     
     while True:
-        choice = input("请输入选项 (1 或 2): ").strip()
+        choice = input("Enter choice (1 or 2): ").strip()
         if choice == '1':
             is_rescan = True
             break
@@ -402,10 +434,10 @@ if __name__ == "__main__":
             is_rescan = False
             break
         else:
-            print("❌ 输入无效，请输入 1 或 2")
+            print("❌ Invalid input. Enter 1 or 2.")
 
-    print(f"\n✅ 已确认模式: {'重新扫描' if is_rescan else '断点续传'}\n")
+    print(f"\n✅ Mode: {'Rescan' if is_rescan else 'Resume'}\n")
     
-    # 启动系统
+    # Start System
     audit_system = AuditSystem(rescan_mode=is_rescan)
     audit_system.run_audit()
