@@ -3,6 +3,8 @@ import logging
 import sqlite3
 import json
 import time
+import subprocess # [新增] 用于执行 shell 命令
+import random     # [新增] 用于生成随机文件名
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -22,9 +24,6 @@ class AuditSystem:
     def __init__(self, rescan_mode: bool = False):
         """
         初始化审计系统。
-        :param rescan_mode: 
-            True (模式1): 重新扫描。不跳过现有项目，生成带时间戳的新报告。
-            False (模式2): 断点续传。跳过已存在报告的项目。
         """
         self.rescan_mode = rescan_mode
         self.reporter = Reporter()
@@ -56,6 +55,7 @@ class AuditSystem:
                           line_number INTEGER,
                           code_snippet TEXT,
                           ai_verdict TEXT,
+                          verification_result TEXT,
                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             conn.commit()
             conn.close()
@@ -70,14 +70,15 @@ class AuditSystem:
         try:
             conn = sqlite3.connect('my_arsenal.db')
             c = conn.cursor()
-            c.execute("INSERT INTO vulnerabilities (project_name, vuln_type, severity, file_path, line_number, code_snippet, ai_verdict) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            c.execute("INSERT INTO vulnerabilities (project_name, vuln_type, severity, file_path, line_number, code_snippet, ai_verdict, verification_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                       (project_name, 
                        vuln_data.get('original_rule_id'), 
                        vuln_data.get('verdict'),
                        vuln_data.get('file_path'), 
                        vuln_data.get('line_number'),
                        vuln_data.get('code_snippet', '')[:500], 
-                       vuln_data.get('reason', '')))
+                       vuln_data.get('reason', ''),
+                       vuln_data.get('verify_output', 'Not Verified'))) 
             conn.commit()
             conn.close()
             print(f"💾 [C2] 漏洞已入库: {vuln_data.get('original_rule_id')}")
@@ -86,14 +87,12 @@ class AuditSystem:
 
     def _save_project_report(self, project_name, vulnerabilities):
         """
-        根据模式生成报告文件名，并包含PoC信息。
+        生成包含验证结果的报告。
         """
         if self.rescan_mode:
-            # 生成带时间戳的文件名
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"{project_name}_{timestamp}.md"
         else:
-            # 标准文件名
             filename = f"{project_name}_report.md"
 
         report_path = os.path.join(self.reports_dir, filename)
@@ -111,14 +110,37 @@ class AuditSystem:
                     f.write(f"- **AI 裁决**: **{v.get('verdict')}**\n")
                     f.write(f"- **分析结论**: {v.get('reason')}\n")
                     
-                    # === [新增] PoC 信息展示 ===
+                    # === [修改] 自动化验证结果展示 (更详细的状态) ===
                     if v.get('has_poc'):
-                        f.write(f"\n> 💣 **自动化 PoC 已生成**\n")
-                        f.write(f"> **脚本位置**: `{v.get('poc_path')}`\n")
-                        f.write(f"> **如何验证**: 请执行以下命令（将脚本注入源码目录运行）：\n")
-                        f.write(f"```bash\n{v.get('poc_cmd')}\n```\n")
+                        f.write(f"\n> 🛡️ **自动化验证报告 (Auto-Verify)**\n")
+                        f.write(f"> **PoC 脚本**: `{v.get('poc_path')}`\n")
+                        
+                        verify_status = v.get('verify_status', 'UNKNOWN')
+                        verify_output = v.get('verify_output', '').strip()
+                        
+                        if verify_status == "EXECUTION_PASS":
+                            f.write(f"> **验证状态**: ✅ 测试通过 (PASS) - 脚本运行成功且未崩溃\n")
+                            f.write(f"> **说明**: 漏洞可能已被防御，或 PoC 仅验证了连通性。\n")
+                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
+                        
+                        elif verify_status == "EXECUTION_PANIC":
+                            f.write(f"> **验证状态**: 🚨 触发 PANIC (漏洞实锤) - 目标代码崩溃\n")
+                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
+
+                        elif verify_status == "EXECUTION_FAIL":
+                            f.write(f"> **验证状态**: ⚠️ 测试失败 (FAIL) - 脚本运行了但断言未通过\n")
+                            f.write(f"> **控制台输出**: \n```text\n{verify_output}\n```\n")
+
+                        elif verify_status == "COMPILATION_FAILED":
+                            f.write(f"> **验证状态**: ❌ 编译/环境失败 (AI 尝试修复 {v.get('fix_attempts', 0)} 次后仍失败)\n")
+                            f.write(f"> **原因**: 可能是缺包、语法错误或环境缺失\n")
+                            f.write(f"> **错误日志**: \n```text\n{verify_output}\n```\n")
+                        else:
+                            f.write(f"> **验证状态**: ❓ 未知状态 / 运行时异常\n")
+                            f.write(f"> **输出**: \n```text\n{verify_output}\n```\n")
+                    
                     elif v.get('verdict', '').upper() in ['HIGH', 'MEDIUM']:
-                         f.write(f"\n> ⚠️ **PoC 未生成**: AI 判断无法进行单元测试或无需测试。\n")
+                         f.write(f"\n> ⚠️ **验证**: AI 判断无法进行单元测试或无需测试。\n")
                          
                     f.write("---\n")
             self.reporter.log_info(f"✅ Report saved: {filename}")
@@ -127,16 +149,12 @@ class AuditSystem:
 
     def _check_if_project_scanned(self, project_name):
         """检查该项目是否已经存在任何审计报告"""
-        # 1. 检查标准报告
         std_report = os.path.join(self.reports_dir, f"{project_name}_report.md")
         if os.path.exists(std_report) and os.path.getsize(std_report) > 50:
             return True
-        
-        # 2. 检查是否有带时间戳的历史报告
         for f in os.listdir(self.reports_dir):
             if f.startswith(f"{project_name}_") and f.endswith(".md"):
                 return True
-        
         return False
 
     def run_audit(self):
@@ -156,7 +174,6 @@ class AuditSystem:
         for i, project_name in enumerate(available_projects):
             project_relative_path = project_name 
             
-            # --- 根据模式决定是否跳过 ---
             if not self.rescan_mode:
                 if self._check_if_project_scanned(project_name):
                     self.reporter.log_info(f"⏩ [Skip] {project_name} ({i+1}/{len(available_projects)}): Report exists.")
@@ -164,7 +181,6 @@ class AuditSystem:
 
             self.reporter.log_info(f"\n🚀 [{i+1}/{len(available_projects)}] Auditing: {project_name}")
 
-            # === [新增] 准备 PoC 存放目录 ===
             current_time_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             poc_base_dir = os.path.join(os.getcwd(), "poc_scripts", f"{project_name}_{current_time_str}")
 
@@ -205,7 +221,6 @@ class AuditSystem:
             
             project_vulnerabilities = []
             
-            # 提取漏洞
             raw_results = []
             if sarif_results.get('runs'):
                 for run in sarif_results['runs']:
@@ -217,7 +232,6 @@ class AuditSystem:
                         raw_results.append(result)
 
             self.reporter.log_info(f"🔍 Found {len(raw_results)} issues in {project_name}")
-
             full_project_source_path = os.path.join(PROJECTS_ROOT, project_relative_path)
 
             for result in raw_results:
@@ -227,7 +241,6 @@ class AuditSystem:
                 start_line = location.get('region', {}).get('startLine', 0)
                 full_file_path = os.path.join(full_project_source_path, file_uri)
 
-                # 读取代码片段
                 code_snippet = ""
                 try:
                     if os.path.exists(full_file_path):
@@ -236,14 +249,10 @@ class AuditSystem:
                             start_idx = max(0, start_line - 21)
                             end_idx = min(len(lines), start_line + 20)
                             code_snippet = "".join(lines[start_idx:end_idx])
-                except:
-                    pass
+                except: pass
 
-                # AI 分析
-                if PROJECT_API_CALL_COUNTS.get(project_name, 0) >= MAX_CALLS_PER_PROJECT:
-                    break 
-                if APICaller._circuit_breaker_tripped:
-                    break
+                if PROJECT_API_CALL_COUNTS.get(project_name, 0) >= MAX_CALLS_PER_PROJECT: break 
+                if APICaller._circuit_breaker_tripped: break
 
                 try:
                     self.reporter.log_info(f"🕵️ Analyzing: {rule_id} @ {file_uri}:{start_line}")
@@ -253,62 +262,118 @@ class AuditSystem:
                     
                     analysis_result['original_rule_id'] = rule_id
                     analysis_result['code_snippet'] = code_snippet
-                    analysis_result['file_uri'] = file_uri # 确保有这个字段
+                    analysis_result['file_uri'] = file_uri
 
-                    # === [新增] 处理 PoC 脚本生成 ===
+                    # === [核心逻辑] 自愈与自动化验证 ===
                     poc_code = analysis_result.get('poc_code', '')
                     is_testable = analysis_result.get('is_testable', False)
                     verdict = analysis_result.get('verdict', '').upper()
                     
-                    analysis_result['has_poc'] = False # 默认无
+                    analysis_result['has_poc'] = False
+                    analysis_result['verify_status'] = 'SKIPPED'
+                    analysis_result['verify_output'] = ''
+                    analysis_result['fix_attempts'] = 0
 
-                    # 只有 High/Medium 且 AI 说可测且有代码，才保存
                     if (verdict in ['HIGH', 'MEDIUM']) and is_testable and poc_code and len(poc_code) > 20:
                         try:
-                            if not os.path.exists(poc_base_dir):
-                                os.makedirs(poc_base_dir)
+                            if not os.path.exists(poc_base_dir): os.makedirs(poc_base_dir)
 
-                            # 生成文件名: rule_id_行号_test.go
-                            safe_rule_id = str(rule_id).replace("/", "_").replace("-", "_")
-                            poc_filename = f"{safe_rule_id}_L{start_line}_test.go"
+                            random_suffix = random.randint(1000, 9999)
+                            poc_filename = f"{project_name}_{current_time_str}_{random_suffix}_test.go"
                             poc_save_path = os.path.join(poc_base_dir, poc_filename)
                             
-                            # 写入文件
                             with open(poc_save_path, "w", encoding="utf-8") as f:
                                 clean_code = poc_code.replace("```go", "").replace("```", "").strip()
                                 f.write(clean_code)
                             
-                            self.reporter.log_info(f"💣 PoC Saved: {poc_save_path}")
+                            self.reporter.log_info(f"💣 Draft Generated: {poc_filename}")
                             
-                            # 生成运行指令 (Linux/Mac)
                             target_source_dir = os.path.dirname(os.path.join(full_project_source_path, file_uri))
-                            run_cmd = (
-                                f"cp \"{poc_save_path}\" \"{target_source_dir}/\" && "
-                                f"cd \"{target_source_dir}\" && "
-                                f"go test -v {poc_filename}"
-                            )
+                            
+                            MAX_FIX_ATTEMPTS = 5
+                            current_attempt_code = clean_code
+                            
+                            for attempt in range(MAX_FIX_ATTEMPTS + 1):
+                                self.reporter.log_info(f"🔧 [Verify] Attempt {attempt+1}/{MAX_FIX_ATTEMPTS + 1}...")
+
+                                copy_cmd = f"cp \"{poc_save_path}\" \"{target_source_dir}/\""
+                                os.system(copy_cmd)
+
+                                verify_cmd = f"cd \"{target_source_dir}\" && go test -v {poc_filename}"
+                                
+                                try:
+                                    process = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=15)
+                                    output = process.stdout + "\n" + process.stderr
+                                    
+                                    # === [修改] 更严格的错误判定逻辑 ===
+                                    compile_errors = [
+                                        "build failed", 
+                                        "undefined:", 
+                                        "imported and not used",
+                                        "no required module",  # [新增] 缺包
+                                        "cannot find package", # [新增] 找不到包
+                                        "setup failed"         # [新增] 测试启动失败
+                                    ]
+                                    
+                                    is_compile_error = any(e in output for e in compile_errors)
+
+                                    if is_compile_error:
+                                        # === 编译或环境错误，需要修复 ===
+                                        if attempt < MAX_FIX_ATTEMPTS:
+                                            self.reporter.log_warning(f"❌ Build/Env Failed. Asking AI to fix (Attempt {attempt+1})...")
+                                            
+                                            fixed_code = self.vulnerability_analyzer.fix_poc_code(current_attempt_code, output)
+                                            current_attempt_code = fixed_code
+                                            
+                                            with open(poc_save_path, "w", encoding="utf-8") as f:
+                                                f.write(fixed_code)
+                                            
+                                            analysis_result['fix_attempts'] = attempt + 1
+                                            continue 
+                                        else:
+                                            analysis_result['verify_status'] = "COMPILATION_FAILED"
+                                            analysis_result['verify_output'] = output
+                                            analysis_result['fix_attempts'] = attempt
+                                    else:
+                                        # === 脚本能跑起来了 ===
+                                        self.reporter.log_info(f"✅ Execution Finished!")
+                                        
+                                        if "PASS" in output:
+                                            analysis_result['verify_status'] = "EXECUTION_PASS"
+                                        elif "panic:" in output:
+                                            analysis_result['verify_status'] = "EXECUTION_PANIC"
+                                        elif "FAIL" in output:
+                                            analysis_result['verify_status'] = "EXECUTION_FAIL"
+                                        else:
+                                            analysis_result['verify_status'] = "EXECUTION_UNKNOWN"
+
+                                        analysis_result['verify_output'] = output
+                                        break 
+
+                                except subprocess.TimeoutExpired:
+                                    analysis_result['verify_status'] = "TIMEOUT"
+                                    analysis_result['verify_output'] = "Execution timed out."
+                                    break
                             
                             analysis_result['has_poc'] = True
                             analysis_result['poc_path'] = poc_save_path
-                            analysis_result['poc_cmd'] = run_cmd
+                            
+                            try:
+                                os.remove(os.path.join(target_source_dir, poc_filename))
+                            except: pass
+
                         except Exception as e:
-                            self.reporter.log_error(f"Failed to save PoC: {e}")
+                            self.reporter.log_error(f"Failed to auto-verify PoC: {e}")
 
                     project_vulnerabilities.append(analysis_result)
-                    
                     self._save_to_sqlite(project_name, analysis_result)
-
                     if analysis_result.get('status') == 'aborted': break 
                 except Exception as e:
                     self.reporter.log_error(f"Analysis error: {e}")
 
-            # 保存报告
             self._save_project_report(project_name, project_vulnerabilities)
-
             self.codeql_manager.cleanup_database(db_path)
-            
-            if APICaller._circuit_breaker_tripped:
-                break
+            if APICaller._circuit_breaker_tripped: break
 
         self.reporter.log_info("MassAudit Pro: Process completed.")
 
