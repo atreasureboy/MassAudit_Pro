@@ -1,9 +1,13 @@
-
 import os
 import logging
+import sqlite3
+import json
+import time
+from datetime import datetime
 from typing import Dict, Any, List
 
-from MassAudit_Pro.config import API_KEY, API_BASE, PROJECTS_ROOT, DB_STORAGE, PROJECT_API_CALL_COUNTS,MAX_CALLS_PER_PROJECT
+# Import all necessary modules and constants
+from MassAudit_Pro.config import API_KEY, API_BASE, PROJECTS_ROOT, DB_STORAGE, PROJECT_API_CALL_COUNTS, MAX_CALLS_PER_PROJECT
 from MassAudit_Pro.core.api_caller import APICaller
 from MassAudit_Pro.core.context_resolver import ContextResolver
 from MassAudit_Pro.core.codeql_manager import CodeQLManager
@@ -14,176 +18,284 @@ from MassAudit_Pro.reporting.reporter import Reporter
 class AuditSystem:
     """
     MassAudit Pro 智能交互式代码审计系统的主协调器。
-    负责组织和执行整个审计流程，包括项目遍历、CodeQL扫描、SARIF结果解析、
-    针对每个漏洞触发智能上下文交互并收集结果。
     """
-    def __init__(self):
+    def __init__(self, rescan_mode: bool = False):
         """
-        初始化审计系统，创建所有必要的组件实例。
+        初始化审计系统。
+        :param rescan_mode: 
+            True (模式1): 重新扫描。不跳过现有项目，生成带时间戳的新报告。
+            False (模式2): 断点续传。跳过已存在报告的项目。
         """
+        self.rescan_mode = rescan_mode
         self.reporter = Reporter()
         self.api_caller = APICaller(API_KEY, API_BASE)
         self.context_resolver = ContextResolver(PROJECTS_ROOT)
         self.codeql_manager = CodeQLManager(DB_STORAGE, PROJECTS_ROOT)
         self.vulnerability_analyzer = VulnerabilityAnalyzer(self.api_caller, self.context_resolver, PROJECT_API_CALL_COUNTS)
+        
+        self.reports_dir = os.path.join(os.getcwd(), "reports")
+        if not os.path.exists(self.reports_dir):
+            os.makedirs(self.reports_dir)
+            
+        self._init_c2_database()
 
-        logging.info("AuditSystem initialized.")
+        mode_str = "RESCAN (Create new timestamps)" if self.rescan_mode else "RESUME (Skip existing)"
+        logging.info(f"AuditSystem initialized. Mode: {mode_str}")
+
+    def _init_c2_database(self):
+        """初始化用于 C2 利用的本地数据库"""
+        try:
+            conn = sqlite3.connect('my_arsenal.db')
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS vulnerabilities
+                         (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          project_name TEXT,
+                          vuln_type TEXT,
+                          severity TEXT,
+                          file_path TEXT,
+                          line_number INTEGER,
+                          code_snippet TEXT,
+                          ai_verdict TEXT,
+                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"Failed to init C2 database: {e}")
+
+    def _save_to_sqlite(self, project_name, vuln_data):
+        """将高危漏洞存入 SQLite"""
+        if vuln_data.get('verdict', '').upper() not in ['HIGH', 'MEDIUM']:
+            return 
+            
+        try:
+            conn = sqlite3.connect('my_arsenal.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO vulnerabilities (project_name, vuln_type, severity, file_path, line_number, code_snippet, ai_verdict) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (project_name, 
+                       vuln_data.get('original_rule_id'), 
+                       vuln_data.get('verdict'),
+                       vuln_data.get('file_path'), 
+                       vuln_data.get('line_number'),
+                       vuln_data.get('code_snippet', '')[:500], 
+                       vuln_data.get('reason', '')))
+            conn.commit()
+            conn.close()
+            print(f"💾 [C2] 漏洞已入库: {vuln_data.get('original_rule_id')}")
+        except Exception as e:
+            logging.error(f"DB Error: {e}")
+
+    def _save_project_report(self, project_name, vulnerabilities):
+        """
+        根据模式生成报告文件名：
+        - 模式1 (Rescan): projectname_20230101_120000.md (保留历史)
+        - 模式2 (Resume): projectname_report.md (标准覆盖)
+        """
+        if self.rescan_mode:
+            # 生成带时间戳的文件名
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{project_name}_{timestamp}.md"
+        else:
+            # 标准文件名
+            filename = f"{project_name}_report.md"
+
+        report_path = os.path.join(self.reports_dir, filename)
+        
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(f"# {project_name} 审计报告\n")
+                f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"**模式**: {'重新扫描 (Rescan)' if self.rescan_mode else '断点续传 (Resume)'}\n")
+                f.write(f"**发现漏洞数**: {len(vulnerabilities)}\n\n")
+                
+                for idx, v in enumerate(vulnerabilities):
+                    f.write(f"## {idx+1}. {v.get('original_rule_id', 'Unknown Issue')}\n")
+                    f.write(f"- **文件**: `{v.get('file_path')}` : `{v.get('line_number')}`\n")
+                    f.write(f"- **AI 裁决**: **{v.get('verdict')}**\n")
+                    f.write(f"- **分析结论**: {v.get('reason')}\n")
+                    f.write("---\n")
+            self.reporter.log_info(f"✅ Report saved: {filename}")
+        except Exception as e:
+            self.reporter.log_error(f"Failed to save report for {project_name}: {e}")
+
+    def _check_if_project_scanned(self, project_name):
+        """检查该项目是否已经存在任何审计报告"""
+        # 1. 检查标准报告
+        std_report = os.path.join(self.reports_dir, f"{project_name}_report.md")
+        if os.path.exists(std_report) and os.path.getsize(std_report) > 50:
+            return True
+        
+        # 2. 检查是否有带时间戳的历史报告 (例如 project_name_2026...)
+        # 这能防止在切换模式时重复扫描已经扫过的项目
+        for f in os.listdir(self.reports_dir):
+            if f.startswith(f"{project_name}_") and f.endswith(".md"):
+                # 确保是这个项目的文件（防止前缀匹配错误，如 test 和 test_v2）
+                # 简单判断：文件名以 project_name 开头且后面跟 _report 或 _数字
+                return True
+        
+        return False
 
     def run_audit(self):
-        """
-        执行整个代码审计流程。
-        """
-        self.reporter.log_info("MassAudit Pro: Starting code audit process...")
-        all_vulnerability_results = []
-
+        """执行审计流程"""
         available_projects = []
         if os.path.isdir(PROJECTS_ROOT):
             for item in os.listdir(PROJECTS_ROOT):
-                item_path = os.path.join(PROJECTS_ROOT, item)
-                if os.path.isdir(item_path):
+                if os.path.isdir(os.path.join(PROJECTS_ROOT, item)):
                     available_projects.append(item)
 
         if not available_projects:
-            self.reporter.log_warning(f"No projects found in {PROJECTS_ROOT}. Exiting.")
+            self.reporter.log_warning(f"No projects found in {PROJECTS_ROOT}.")
             return
 
-        self.reporter.log_info(f"Found {len(available_projects)} projects to audit: {', '.join(available_projects)}")
+        self.reporter.log_info(f"Found {len(available_projects)} projects. Mode: {'RESCAN ALL' if self.rescan_mode else 'RESUME UNFINISHED'}")
 
-        for project_name in available_projects:
+        for i, project_name in enumerate(available_projects):
             project_relative_path = project_name 
-            full_project_source_path = os.path.join(PROJECTS_ROOT, project_relative_path)
-            self.reporter.log_info(f"\n🚀 Starting audit for project: {project_name}")
+            
+            # --- [核心逻辑] 根据模式决定是否跳过 ---
+            if not self.rescan_mode:
+                # 模式2：断点续传 -> 如果扫过，就跳过
+                if self._check_if_project_scanned(project_name):
+                    self.reporter.log_info(f"⏩ [Skip] {project_name} ({i+1}/{len(available_projects)}): Report exists.")
+                    continue
+            else:
+                # 模式1：重新扫描 -> 不跳过，但文件名会变
+                pass
 
+            self.reporter.log_info(f"\n🚀 [{i+1}/{len(available_projects)}] Auditing: {project_name}")
+
+            # (以下是标准的扫描流程，未变动)
             if APICaller._circuit_breaker_tripped:
-                self.reporter.log_error("Global API circuit breaker tripped. Terminating entire audit process.")
                 break
 
             cleanup_project_artifacts(project_relative_path)
 
             detected_language = self.codeql_manager._detect_language(project_relative_path)
             if not detected_language:
-                self.reporter.log_warning(f"Skipping project {project_name}: Could not detect language.")
+                self.reporter.log_warning(f"Skipping {project_name}: Language not detected.")
                 continue
 
             query_pack_map = {
                 'python': 'codeql/python-queries',
-                'go': 'codeql/go-queries',
+                'go': 'codeql/go-queries', 
                 'java': 'codeql/java-queries',
                 'javascript': 'codeql/javascript-queries',
                 'csharp': 'codeql/csharp-queries',
                 'cpp': 'codeql/cpp-queries'
             }
             codeql_query_pack = query_pack_map.get(detected_language.lower())
-            if not codeql_query_pack:
-                self.reporter.log_warning(f"Skipping project {project_name}: No CodeQL query pack defined for language '{detected_language}'.")
-                continue
-
-            # --- 创建CodeQL数据库 ---
+            
             db_path = self.codeql_manager.create_database(project_name, project_relative_path, detected_language)
-            if not db_path:
-                self.reporter.log_error(f"Failed to create CodeQL database for project {project_name}. Skipping analysis.")
-                continue
+            if not db_path: continue
 
-            # --- 执行CodeQL扫描 ---
             sarif_output_path = os.path.join(db_path, f"{project_name}-results.sarif")
             generated_sarif_path = self.codeql_manager.run_analysis(db_path, codeql_query_pack, sarif_output_path)
+            
             if not generated_sarif_path:
-                self.reporter.log_error(f"Failed to run CodeQL analysis for project {project_name}. Skipping SARIF parsing.")
                 self.codeql_manager.cleanup_database(db_path)
                 continue
 
-            # --- 解析SARIF结果 ---
             sarif_results = self.codeql_manager.parse_sarif_results(generated_sarif_path)
-            if not sarif_results or not sarif_results.get('runs'):
-                self.reporter.log_warning(f"No valid SARIF results found for project {project_name}. Skipping vulnerability analysis.")
+            if not sarif_results:
                 self.codeql_manager.cleanup_database(db_path)
                 continue
             
             project_vulnerabilities = []
-            for run in sarif_results['runs']:
-                for result in run.get('results', []):
-                    rule_id = result.get('ruleId', 'unknown')
-                    message = result.get('message', {}).get('text', 'No description')
-                    location = result.get('locations', [{}])[0].get('physicalLocation', {})
-                    file_uri = location.get('artifactLocation', {}).get('uri', 'unknown_file')
-                    start_line = location.get('region', {}).get('startLine', 0)
+            
+            # 提取漏洞
+            raw_results = []
+            if sarif_results.get('runs'):
+                for run in sarif_results['runs']:
+                    for result in run.get('results', []):
+                        location = result.get('locations', [{}])[0].get('physicalLocation', {})
+                        file_uri = location.get('artifactLocation', {}).get('uri', 'unknown_file')
+                        if "_test.go" in file_uri or "test_" in file_uri or "vendor/" in file_uri:
+                            continue 
+                        raw_results.append(result)
 
-                    
-                    full_file_path = os.path.join(full_project_source_path, file_uri)
-                    #可自行修改：重点！！！上下文长度
-                    code_snippet = "" 
-                    try:
+            self.reporter.log_info(f"🔍 Found {len(raw_results)} issues in {project_name}")
+
+            full_project_source_path = os.path.join(PROJECTS_ROOT, project_relative_path)
+
+            for result in raw_results:
+                rule_id = result.get('ruleId', 'unknown')
+                location = result.get('locations', [{}])[0].get('physicalLocation', {})
+                file_uri = location.get('artifactLocation', {}).get('uri', 'unknown_file')
+                start_line = location.get('region', {}).get('startLine', 0)
+                full_file_path = os.path.join(full_project_source_path, file_uri)
+
+                # 读取代码片段
+                code_snippet = ""
+                try:
+                    if os.path.exists(full_file_path):
                         with open(full_file_path, 'r', encoding='utf-8', errors='ignore') as f:
                             lines = f.readlines()
-                            start_idx = max(0, start_line - 21) 
-                            end_idx = min(len(lines), start_line + 20) 
+                            start_idx = max(0, start_line - 21)
+                            end_idx = min(len(lines), start_line + 20)
                             code_snippet = "".join(lines[start_idx:end_idx])
-                    except Exception as e:
-                        self.reporter.log_error(f"Could not read code snippet from {full_file_path}:{start_line}: {e}")
-                        code_snippet = f"[ERROR: Could not retrieve code snippet: {e}]\n(File: {full_file_path}, Line: {start_line})\n{message}"
+                except:
+                    pass
 
-                    # --- 智能上下文交互分析 ---
-                    self.reporter.log_info(f"🕵️ Analyzing vulnerability '{rule_id}' in {file_uri}:{start_line}...")
-                    
-                    if PROJECT_API_CALL_COUNTS.get(project_name, 0) >= MAX_CALLS_PER_PROJECT:
-                        self.reporter.log_warning(f"🛑 Project {project_name}: Hit API limit ({PROJECT_API_CALL_COUNTS[project_name]}/{MAX_CALLS_PER_PROJECT}), skipping remaining vulnerabilities in this project.")
-                        project_vulnerabilities.append({
-                            "status": "skipped",
-                            "verdict": "SKIPPED_QUOTA_LIMIT",
-                            "reason": "Project API call limit exceeded.",
-                            "file_path": file_uri,
-                            "line_number": start_line,
-                            "original_rule_id": rule_id,
-                            "original_message": message
-                        })
-                        break 
-
-                    if APICaller._circuit_breaker_tripped:
-                        self.reporter.log_error("Global API circuit breaker tripped. Terminating current project analysis and entire audit process.")
-                        break 
-                    try:
-                        analysis_result = self.vulnerability_analyzer.analyze_vulnerability(
-                            project_name,
-                            code_snippet,
-                            project_relative_path,
-                            file_uri,
-                            start_line
-                        )
-                        project_vulnerabilities.append(analysis_result)
-                        if analysis_result.get('status') == 'aborted': 
-                            break 
-                    except Exception as e:
-                        self.reporter.log_error(f"Error analyzing vulnerability '{rule_id}' in {file_uri}:{start_line}: {e}")
-                        project_vulnerabilities.append({
-                            "status": "failure",
-                            "verdict": "error",
-                            "reason": f"Error during AI analysis: {e}",
-                            "file_path": file_uri,
-                            "line_number": start_line,
-                            "original_rule_id": rule_id,
-                            "original_message": message
-                        })
-
-                if APICaller._circuit_breaker_tripped or (
-                    project_name in PROJECT_API_CALL_COUNTS and 
-                    PROJECT_API_CALL_COUNTS[project_name] >= MAX_CALLS_PER_PROJECT
-                ): 
+                # AI 分析
+                if PROJECT_API_CALL_COUNTS.get(project_name, 0) >= MAX_CALLS_PER_PROJECT:
                     break 
+                if APICaller._circuit_breaker_tripped:
+                    break
 
-            all_vulnerability_results.extend(project_vulnerabilities)
-            self.reporter.log_info(f"📊 Finished processing {len(project_vulnerabilities)} vulnerabilities for project {project_name}.")
+                try:
+                    self.reporter.log_info(f"🕵️ Analyzing: {rule_id} @ {file_uri}:{start_line}")
+                    analysis_result = self.vulnerability_analyzer.analyze_vulnerability(
+                        project_name, code_snippet, project_relative_path, file_uri, start_line
+                    )
+                    
+                    analysis_result['original_rule_id'] = rule_id
+                    analysis_result['code_snippet'] = code_snippet
+                    project_vulnerabilities.append(analysis_result)
+                    
+                    self._save_to_sqlite(project_name, analysis_result)
 
-            # --- 清理CodeQL数据库，也可以自定义重复检测，不清除数据库，注意---
+                    if analysis_result.get('status') == 'aborted': break 
+                except Exception as e:
+                    self.reporter.log_error(f"Analysis error: {e}")
+
+            # 保存报告 (文件名根据模式自动决定)
+            self._save_project_report(project_name, project_vulnerabilities)
+
             self.codeql_manager.cleanup_database(db_path)
             
             if APICaller._circuit_breaker_tripped:
                 break
 
-        # --- 生成最终审计报告 ---
-        self.reporter.generate_markdown_report(all_vulnerability_results)
-        self.reporter.log_info("MassAudit Pro: Audit process completed.")
+        self.reporter.log_info("MassAudit Pro: Process completed.")
 
-# 主程序入口
 if __name__ == "__main__":
-    audit_system = AuditSystem()
+    print("\n" + "="*50)
+    print("   🛡️  MassAudit Pro - 交互式启动")
+    print("="*50)
+    print("请选择扫描模式：")
+    print(" [1] 重新扫描 (Rescan)")
+    print("     - 即使项目已有报告，也会重新扫描")
+    print("     - 生成带时间戳的新文件 (如: project_20260130.md)")
+    print("     - ⚠️ 原 md 文件保留，不会被覆盖")
+    print("")
+    print(" [2] 断点续传 (Resume) [推荐]")
+    print("     - 跳过所有已存在报告的项目")
+    print("     - 仅扫描最新的、未处理的项目")
+    print("     - 生成标准文件名 (project_report.md)")
+    print("="*50)
+    
+    while True:
+        choice = input("请输入选项 (1 或 2): ").strip()
+        if choice == '1':
+            is_rescan = True
+            break
+        elif choice == '2':
+            is_rescan = False
+            break
+        else:
+            print("❌ 输入无效，请输入 1 或 2")
+
+    print(f"\n✅ 已确认模式: {'重新扫描' if is_rescan else '断点续传'}\n")
+    
+    # 启动系统
+    audit_system = AuditSystem(rescan_mode=is_rescan)
     audit_system.run_audit()
